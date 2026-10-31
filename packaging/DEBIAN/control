@@ -1,0 +1,13 @@
+Package: ambient-auto
+Version: @VERSION@
+Architecture: all
+Maintainer: Marfffan <marfffan@users.noreply.github.com>
+Installed-Size: @SIZE@
+Depends: python3 (>= 3.10), python3-pyqt6, v4l-utils, libkf6screen-bin | kscreen, systemd, util-linux
+Section: utils
+Priority: optional
+Description: Автоматическая яркость экрана и клавиатуры по датчику освещённости
+ Читает датчик освещённости MacBook (acpi-als) и управляет яркостью
+ экрана через KWin/KScreen, подсветкой клавиатуры через sysfs и
+ настройками камеры FaceTime HD. В комплекте графическое приложение
+ для включения и отключения автоматики и настройки порогов.

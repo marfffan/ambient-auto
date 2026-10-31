@@ -1,0 +1,36 @@
+#!/bin/sh
+set -e
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable ambient-auto.service >/dev/null 2>&1 || true
+systemctl restart ambient-auto.service >/dev/null 2>&1 || true
+
+# Конфиг по умолчанию: используется демоном до входа в графический сеанс.
+install -d -m755 /etc/ambient-auto
+if [ ! -f /etc/ambient-auto/config.json ]; then
+    install -m644 /usr/share/ambient-auto/config.default.json \
+        /etc/ambient-auto/config.json
+fi
+
+# Личный конфиг устанавливающего пользователя (его правит приложение).
+USER_NAME=""
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    USER_NAME="$SUDO_USER"
+fi
+if [ -z "$USER_NAME" ]; then
+    USER_NAME=$(getent passwd 1000 2>/dev/null | cut -d: -f1 || true)
+fi
+
+if [ -n "$USER_NAME" ]; then
+    HOME_DIR=$(getent passwd "$USER_NAME" | cut -d: -f6)
+    if [ -n "$HOME_DIR" ] && [ -d "$HOME_DIR" ]; then
+        install -d -m755 "$HOME_DIR/.config/ambient-auto"
+        if [ ! -f "$HOME_DIR/.config/ambient-auto/config.json" ]; then
+            install -m644 /usr/share/ambient-auto/config.default.json \
+                "$HOME_DIR/.config/ambient-auto/config.json"
+        fi
+        chown -R "$USER_NAME": "$HOME_DIR/.config/ambient-auto" 2>/dev/null || true
+    fi
+fi
+
+exit 0
