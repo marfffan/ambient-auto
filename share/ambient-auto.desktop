@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Автояркость MacBook
+Name[en]=MacBook Ambient Brightness
+Comment=Яркость экрана и клавиатуры по датчику освещённости
+Comment[en]=Screen and keyboard brightness driven by the ambient light sensor
+Exec=/usr/bin/ambient-auto-gui
+Icon=ambient-auto
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=яркость;подсветка;датчик;свет;камера;brightness;ambient;light;
+StartupNotify=true
