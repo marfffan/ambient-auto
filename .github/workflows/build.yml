@@ -1,0 +1,21 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Собрать .deb
+        run: ./build-deb.sh
+      - name: Загрузить артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: ambient-auto-deb
+          path: build/*.deb
+          if-no-files-found: error
