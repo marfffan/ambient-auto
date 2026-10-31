@@ -7,7 +7,9 @@
 
 [![build](https://github.com/marfffan/ambient-auto/actions/workflows/build.yml/badge.svg)](https://github.com/marfffan/ambient-auto/actions/workflows/build.yml)
 
-![Приложение «Автояркость MacBook»](docs/screenshot-light.png)
+![Приложение «Автояркость MacBook»](docs/screenshot-ru.png)
+
+<sub>English UI — [screenshot-en.png](docs/screenshot-en.png), тёмный режим — [screenshot-dark.png](docs/screenshot-dark.png)</sub>
 
 ## Зачем это нужно
 
@@ -19,7 +21,8 @@ KDE Powerdevil умеет менять яркость по датчику тол
 - клавиатура полностью гаснет при любом свете (настраивается);
 - камера никогда не замедляется: всегда 30 кадров/с, в темноте яркость
   добирается цифровым усилением;
-- всё настраивается в приложении, без правки файлов и перезапуска службы.
+- всё настраивается в приложении, без правки файлов и перезапуска службы;
+- интерфейс на пяти языках, переключается прямо в окне и запоминается.
 
 ## Возможности
 
@@ -40,11 +43,11 @@ KDE Powerdevil умеет менять яркость по датчику тол
 
 ### Готовый пакет
 
-Скачайте `ambient-auto_1.0.0_all.deb` со страницы
+Скачайте `ambient-auto_1.0.1_all.deb` со страницы
 [Releases](https://github.com/marfffan/ambient-auto/releases) и установите:
 
 ```sh
-sudo apt install ./ambient-auto_1.0.0_all.deb
+sudo apt install ./ambient-auto_1.0.1_all.deb
 ```
 
 Пакет сам:
@@ -68,7 +71,7 @@ ambient-auto-gui
 git clone https://github.com/marfffan/ambient-auto.git
 cd ambient-auto
 ./build-deb.sh          # или make deb
-sudo apt install ./build/ambient-auto_1.0.0_all.deb
+sudo apt install ./build/ambient-auto_1.0.1_all.deb
 ```
 
 ## Как пользоваться
@@ -91,6 +94,23 @@ sudo apt install ./build/ambient-auto_1.0.0_all.deb
 Пороги и проценты для экрана и клавиатуры задаются независимо.
 
 Изменения применяются в течение 2 секунд, перезапуск не нужен.
+
+## Язык интерфейса
+
+Язык выбирается в самом приложении — список в правой части заголовка окна.
+Смена языка применяется сразу, перезапускать ничего не нужно.
+
+Доступны: русский, английский, немецкий, испанский, французский и пункт
+«Системный» — он берёт язык из локали сеанса (`LANG`/`LC_ALL`), а при
+неизвестной локали показывает английский.
+
+Выбор хранится в конфиге ключом `language` и переживает перезапуск службы и
+переустановку пакета. Название и описание приложения в меню KDE тоже
+переводятся (`Name[ru]`, `Name[en]` и т. д. в desktop-файле).
+
+Переводы лежат в `src/i18n.py` обычными словарями — чтобы добавить язык,
+достаточно дописать словарь и строку в `LANGUAGES`, никакие `.ts`/`.qm` и
+`lrelease` не нужны.
 
 ## Как это работает
 
@@ -117,6 +137,7 @@ sudo apt install ./build/ambient-auto_1.0.0_all.deb
   "enabled": true,
   "poll_seconds": 2.0,
   "manual_pause_minutes": 0,
+  "language": "system",
   "screen": {
     "dark": 5, "normal": 15, "bright": 35,
     "dark_enter": 12, "dark_exit": 20,
@@ -136,6 +157,7 @@ sudo apt install ./build/ambient-auto_1.0.0_all.deb
 | `enabled` | включена ли автоматика |
 | `poll_seconds` | период опроса датчика, секунды |
 | `manual_pause_minutes` | пауза после ручной правки яркости в панели KDE (0 — не ставить) |
+| `language` | язык интерфейса: `system`, `ru`, `en`, `de`, `es`, `fr` |
 | `screen.*` / `keyboard.*` | проценты яркости для полос и пороги в люксах |
 | `camera.*` | цифровое усиление по полосам; `fps` — частота кадров |
 
@@ -146,6 +168,7 @@ sudo apt install ./build/ambient-auto_1.0.0_all.deb
 ```
 src/ambient-auto          демон
 src/gui.py                приложение (PyQt6)
+src/i18n.py               переводы интерфейса
 src/ambient-auto-gui      launcher
 systemd/                  unit-файл службы
 share/                    конфиг по умолчанию, desktop-файл, иконка
