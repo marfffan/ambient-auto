@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""Автоматика по датчику освещённости MacBook (acpi-als).
+
+Настройки читаются из ~/.config/ambient-auto/config.json активного
+пользователя KDE (или /etc/ambient-auto/config.json, если сеанса нет).
+Приложение ambient-auto-gui пишет этот файл, демон подхватывает изменения
+в течение пары секунд.
+
+Полосы три: тёмно / свет / ярко. Для экрана и клавиатуры пороги и
+значения задаются независимо. Клавиатуру можно полностью гасить при
+любом свете — это значение по умолчанию.
+
+Экраном управляем через KWin/KScreen (kscreen-doctor): KWin сам владеет
+подсветкой панели и перекрывает прямые записи в sysfs. Клавиатура и
+камера — напрямую через sysfs/v4l2.
+
+Камера всегда работает на 30 fps: в темноте яркость добирается цифровым
+усилением, а не замедлением.
+"""
+
+import copy
+import json
+import os
+import pwd
+import subprocess
+import time
+import traceback
+
+ALS = os.environ.get(
+    "AMBIENT_ALS", "/sys/bus/iio/devices/iio:device0/in_illuminance_input"
+)
+BL_DIR = "/sys/class/backlight/intel_backlight"
+BL_BRIGHTNESS = os.path.join(BL_DIR, "brightness")
+BL_MAX = os.path.join(BL_DIR, "max_brightness")
+KBD = "/sys/class/leds/smc::kbd_backlight/brightness"
+KBD_MAX = "/sys/class/leds/smc::kbd_backlight/max_brightness"
+AE_FPS = "/sys/module/facetimehd/parameters/ae_min_fps"
+VIDEO = "/dev/video0"
+RUNUSER = (
+    "/usr/sbin/runuser"
+    if os.path.exists("/usr/sbin/runuser")
+    else "/usr/bin/runuser"
+)
+STATUS = os.environ.get("AMBIENT_STATUS", "/run/ambient-auto/status.json")
+ETC_CONFIG = "/etc/ambient-auto/config.json"
+
+PROBE_KWIN = 10.0       # как часто пробовать KWin, если сейчас пишем в sysfs
+DRIFT_CHECK = 5.0       # как часто проверять, не сбили ли подсветку клавиатуры
+BUSY_CHECK = 5.0        # как часто смотреть, не открыла ли камера приложение
+
+DEFAULTS = {
+    "enabled": True,
+    "poll_seconds": 2.0,
+    "manual_pause_minutes": 0,
+    "screen": {
+        "dark": 5,
+        "normal": 15,
+        "bright": 35,
+        "dark_enter": 12,
+        "dark_exit": 20,
+        "bright_enter": 100,
+        "bright_exit": 70,
+    },
+    "keyboard": {
+        "dark": 60,
+        "normal": 0,
+        "bright": 0,
+        "dark_enter": 12,
+        "dark_exit": 20,
+        "bright_enter": 100,
+        "bright_exit": 70,
+    },
+    "camera": {
+        "dark": 200,
+        "normal": 128,
+        "bright": 128,
+        "fps": 30,
+    },
+}
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def read_int(path, default=0):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return default
+
+
+def write_int(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(str(int(value)))
+        return True
+    except OSError:
+        return False
+
+
+def clamp_int(value, default, low, high):
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, number))
+
+
+def sanitize(raw):
+    """Проверить конфиг: все числа приводим к допустимым диапазонам."""
+    cfg = copy.deepcopy(DEFAULTS)
+    if not isinstance(raw, dict):
+        return cfg
+
+    if "enabled" in raw:
+        cfg["enabled"] = bool(raw["enabled"])
+    cfg["poll_seconds"] = max(0.5, min(10.0, _float(raw.get("poll_seconds"), 2.0)))
+    cfg["manual_pause_minutes"] = clamp_int(
+        raw.get("manual_pause_minutes"), 0, 0, 120
+    )
+
+    for device, low, high in (("screen", 0, 100), ("keyboard", 0, 100)):
+        section = raw.get(device)
+        if not isinstance(section, dict):
+            continue
+        for key in ("dark", "normal", "bright"):
+            cfg[device][key] = clamp_int(section.get(key), cfg[device][key], low, high)
+        for key in ("dark_enter", "dark_exit", "bright_enter", "bright_exit"):
+            cfg[device][key] = clamp_int(
+                section.get(key), cfg[device][key], 0, 5000
+            )
+        cfg[device] = _fix_thresholds(cfg[device])
+
+    camera = raw.get("camera")
+    if isinstance(camera, dict):
+        for key in ("dark", "normal", "bright"):
+            cfg["camera"][key] = clamp_int(camera.get(key), cfg["camera"][key], 0, 255)
+        cfg["camera"]["fps"] = clamp_int(camera.get("fps"), 30, 1, 30)
+
+    return cfg
+
+
+def _float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fix_thresholds(section):
+    if section["dark_exit"] <= section["dark_enter"]:
+        section["dark_exit"] = section["dark_enter"] + 1
+    if section["bright_enter"] <= section["dark_exit"]:
+        section["bright_enter"] = section["dark_exit"] + 1
+    if section["bright_exit"] >= section["bright_enter"]:
+        section["bright_exit"] = max(
+            section["dark_exit"] + 1, section["bright_enter"] - 1
+        )
+    return section
+
+
+def load_config(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return sanitize(json.load(f))
+    except (OSError, ValueError):
+        return copy.deepcopy(DEFAULTS)
+
+
+def file_signature(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+_session = {"user": None, "uid": None, "home": None, "env": {}, "checked": 0.0}
+
+
+def detect_session(force=False):
+    """Найти активный графический сеанс KDE: пользователя, домашний каталог, env."""
+    now = time.time()
+    if not force and now - _session["checked"] < 5.0:
+        return _session
+    _session["checked"] = now
+
+    try:
+        uids = sorted(int(x) for x in os.listdir("/run/user") if x.isdigit())
+    except OSError:
+        uids = []
+
+    for uid in uids:
+        try:
+            pw = pwd.getpwuid(uid)
+        except KeyError:
+            continue
+        runtime = f"/run/user/{uid}"
+        if not os.path.exists(f"{runtime}/bus"):
+            continue
+        wayland = None
+        try:
+            for name in sorted(os.listdir(runtime)):
+                if name.startswith("wayland-") and os.path.exists(f"{runtime}/{name}"):
+                    wayland = name
+                    break
+        except OSError:
+            pass
+        if not wayland:
+            continue
+        env = {
+            "XDG_RUNTIME_DIR": runtime,
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus",
+            "WAYLAND_DISPLAY": wayland,
+            "XDG_SESSION_TYPE": "wayland",
+        }
+        if os.path.exists("/tmp/.X11-unix/X0"):
+            env["DISPLAY"] = ":0"
+        _session.update(
+            user=pw.pw_name, uid=uid, home=pw.pw_dir, env=env
+        )
+        return _session
+
+    _session.update(user=None, uid=None, home=None, env={})
+    return _session
+
+
+def config_path(session):
+    if session["home"]:
+        return os.path.join(session["home"], ".config", "ambient-auto", "config.json")
+    return ETC_CONFIG
+
+
+def screen_output(home):
+    """Имя внутренней панели по данным KWin (eDP-1 и т.п.)."""
+    path = os.path.join(home or "", ".config", "kwinoutputconfig.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return "eDP-1"
+    for section in data if isinstance(data, list) else []:
+        if isinstance(section, dict) and section.get("name") == "outputs":
+            for out in section.get("data") or []:
+                if not isinstance(out, dict):
+                    continue
+                name = str(out.get("connectorName", ""))
+                if name.startswith(("eDP", "LVDS", "DSI")):
+                    return name
+    return "eDP-1"
+
+
+def read_kwin_brightness(home):
+    """Яркость внутренней панели в процентах по данным KWin (или None)."""
+    path = os.path.join(home or "", ".config", "kwinoutputconfig.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    outputs = []
+    for section in data if isinstance(data, list) else []:
+        if isinstance(section, dict) and section.get("name") == "outputs":
+            outputs = section.get("data") or []
+            break
+    candidates = [o for o in outputs if isinstance(o, dict)]
+    internal = [
+        o
+        for o in candidates
+        if str(o.get("connectorName", "")).startswith(("eDP", "LVDS", "DSI"))
+    ]
+    for out in internal or (candidates if len(candidates) == 1 else []):
+        try:
+            return round(float(out["brightness"]) * 100)
+        except (KeyError, TypeError, ValueError):
+            return None
+    return None
+
+
+def run_kscreen(pct, session):
+    if not session["user"] or not os.path.exists("/usr/bin/kscreen-doctor"):
+        return False
+    output = screen_output(session["home"])
+    command = [RUNUSER, "-u", session["user"], "--", "/usr/bin/env"]
+    command += [f"{key}={value}" for key, value in session["env"].items()]
+    command += ["/usr/bin/kscreen-doctor", f"output.{output}.brightness.{int(pct)}"]
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=20,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def set_screen_kwin(pct, session):
+    if not run_kscreen(pct, session):
+        return False
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        current = read_kwin_brightness(session["home"])
+        if current is not None and abs(current - pct) <= 1:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def set_screen_sysfs(pct):
+    maximum = read_int(BL_MAX, 1953)
+    return write_int(BL_BRIGHTNESS, max(1, round(maximum * pct / 100)))
+
+
+def read_screen_sysfs():
+    maximum = read_int(BL_MAX, 1953)
+    if maximum <= 0:
+        return None
+    return round(read_int(BL_BRIGHTNESS, 0) * 100 / maximum)
+
+
+def set_camera(gain, fps):
+    if os.path.exists(AE_FPS):
+        write_int(AE_FPS, fps)
+    if not os.path.exists(VIDEO):
+        return False
+    try:
+        result = subprocess.run(
+            ["/usr/bin/v4l2-ctl", "-d", VIDEO, "-c", f"brightness={int(gain)}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def camera_busy():
+    """Открыта ли камера каким-нибудь приложением (быстрая проверка /proc)."""
+    target = os.path.realpath(VIDEO)
+    try:
+        pids = [pid for pid in os.listdir("/proc") if pid.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"{fd_dir}/{fd}") == target:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def classify(lux, previous, thresholds):
+    if previous == "bright":
+        return "normal" if lux < thresholds["bright_exit"] else "bright"
+    if previous == "dark":
+        return "normal" if lux >= thresholds["dark_exit"] else "dark"
+    if lux < thresholds["dark_enter"]:
+        return "dark"
+    if lux >= thresholds["bright_enter"]:
+        return "bright"
+    return "normal"
+
+
+def write_status(data):
+    try:
+        directory = os.path.dirname(STATUS)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temporary = STATUS + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, STATUS)
+    except OSError:
+        pass
+
+
+def main():
+    cfg = copy.deepcopy(DEFAULTS)
+    cfg_path = None
+    cfg_sig = None
+    screen_band = None
+    kbd_band = None
+    cam_band = None
+    applied_screen = None
+    applied_screen_pct = None
+    applied_kbd = None
+    applied_cam = None
+    backend = None
+    paused_until = 0.0
+    need_reapply = False
+    pending_screen = False
+    probe_at = 0.0
+    last_lux = 0
+    was_enabled = None
+    message = "запуск"
+    cam_busy = False
+    last_busy_check = 0.0
+    last_drift_check = 0.0
+    screen_drift_check = 0.0
+
+    log("ambient-auto: запуск")
+
+    while True:
+        try:
+            now = time.time()
+            session = detect_session()
+            path = config_path(session)
+            signature = file_signature(path)
+
+            if path != cfg_path or signature != cfg_sig:
+                if cfg_path is not None:
+                    message = "настройки обновлены"
+                    paused_until = 0.0
+                    need_reapply = True
+                    log(f"{message}: {path}")
+                cfg_path, cfg_sig = path, signature
+                cfg = load_config(path)
+
+            enabled = cfg["enabled"]
+            if enabled != was_enabled:
+                if was_enabled is not None:
+                    message = "автоматика включена" if enabled else "автоматика отключена"
+                    log(message)
+                was_enabled = enabled
+                if enabled:
+                    paused_until = 0.0
+                    need_reapply = True
+
+            lux = read_int(ALS, last_lux)
+            last_lux = lux
+
+            screen_band = classify(lux, screen_band or "normal", cfg["screen"])
+            kbd_band = classify(lux, kbd_band or "normal", cfg["keyboard"])
+            cam_band = classify(lux, cam_band or "normal", cfg["screen"])
+
+            screen_percent = cfg["screen"][screen_band]
+            kbd_percent = cfg["keyboard"][kbd_band]
+            cam_gain = cfg["camera"][cam_band]
+            kbd_value = read_int(KBD, 0)
+            kbd_max = read_int(KBD_MAX, 255)
+
+            if enabled:
+                # Ручная правка яркости в панели KDE: ставим автоматику на
+                # паузу, чтобы не воевать с пользователем. Через N минут
+                # (или после сохранения настроек) управление возвращается.
+                if (
+                    backend == "kwin"
+                    and applied_screen_pct is not None
+                    and now >= paused_until
+                    and not need_reapply
+                    and session["home"]
+                ):
+                    current = read_kwin_brightness(session["home"])
+                    if current is not None and abs(current - applied_screen_pct) > 1:
+                        minutes = cfg["manual_pause_minutes"]
+                        if minutes > 0:
+                            paused_until = now + minutes * 60
+                            pending_screen = True
+                            message = (
+                                f"яркость изменена вручную ({current}%) — "
+                                f"пауза {minutes} мин"
+                            )
+                        else:
+                            need_reapply = True
+                            message = "яркость изменена вручную — возвращаю управление"
+                        log(message)
+
+                # --- экран ---
+                want_screen = screen_band != applied_screen or pending_screen
+                if backend != "kwin" and session["user"] and now >= probe_at:
+                    want_screen = True
+                if now >= paused_until and (want_screen or need_reapply):
+                    pct = screen_percent
+                    ok = False
+                    if session["user"] and set_screen_kwin(pct, session):
+                        if backend != "kwin":
+                            message = "экран: управление через KWin/KScreen"
+                            log(message)
+                        backend = "kwin"
+                        ok = True
+                    if not ok:
+                        if backend == "kwin":
+                            message = "KWin недоступен — временно пишу в sysfs"
+                            log(message)
+                        backend = "sysfs"
+                        probe_at = now + PROBE_KWIN
+                        set_screen_sysfs(pct)
+                    applied_screen = screen_band
+                    applied_screen_pct = pct
+                    pending_screen = False
+
+                # --- клавиатура ---
+                target_kbd = round(kbd_max * kbd_percent / 100)
+                drift = now - last_drift_check >= DRIFT_CHECK
+                if (
+                    kbd_band != applied_kbd
+                    or need_reapply
+                    or (drift and abs(kbd_value - target_kbd) > 2)
+                ):
+                    if write_int(KBD, target_kbd):
+                        applied_kbd = kbd_band
+                    if drift:
+                        last_drift_check = now
+
+                # --- камера ---
+                if cam_band != applied_cam or need_reapply:
+                    if set_camera(cam_gain, cfg["camera"]["fps"]):
+                        applied_cam = cam_band
+                        message = f"камера: усиление {cam_gain}, 30 fps"
+
+                # Камеру только что открыли — приложение могло сбросить
+                # параметры, поэтому применяем настройки ещё раз.
+                if now - last_busy_check >= BUSY_CHECK:
+                    busy = camera_busy()
+                    if busy and not cam_busy:
+                        time.sleep(1.0)
+                        if set_camera(cam_gain, cfg["camera"]["fps"]):
+                            applied_cam = cam_band
+                            log("камера открыта — настройки применены")
+                    cam_busy = busy
+                    last_busy_check = now
+
+                if need_reapply:
+                    log(
+                        f"lux={lux:5d} экран={screen_percent}% "
+                        f"клавиатура={kbd_percent}% камера={cam_gain} "
+                        f"({cfg['camera']['fps']} fps)"
+                    )
+                    need_reapply = False
+
+            # Текущее фактическое состояние для GUI.
+            if enabled and backend == "kwin" and session["home"]:
+                actual_screen = read_kwin_brightness(session["home"])
+            else:
+                actual_screen = read_screen_sysfs()
+            if actual_screen is None:
+                actual_screen = applied_screen
+
+            write_status(
+                {
+                    "time": now,
+                    "enabled": enabled,
+                    "lux": lux,
+                    "band": screen_band,
+                    "screen": {
+                        "percent": actual_screen,
+                        "target": screen_percent,
+                        "band": applied_screen,
+                        "backend": backend,
+                        "paused_until": paused_until if now < paused_until else 0,
+                    },
+                    "keyboard": {
+                        "percent": kbd_percent,
+                        "value": kbd_value,
+                        "band": applied_kbd,
+                    },
+                    "camera": {
+                        "gain": cam_gain,
+                        "fps": cfg["camera"]["fps"],
+                        "busy": cam_busy,
+                    },
+                    "config_path": path,
+                    "message": message,
+                }
+            )
+
+            time.sleep(cfg["poll_seconds"])
+        except Exception:
+            log(traceback.format_exc())
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

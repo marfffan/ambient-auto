@@ -1,0 +1,29 @@
+{
+  "enabled": true,
+  "poll_seconds": 2.0,
+  "manual_pause_minutes": 0,
+  "screen": {
+    "dark": 5,
+    "normal": 15,
+    "bright": 35,
+    "dark_enter": 12,
+    "dark_exit": 20,
+    "bright_enter": 100,
+    "bright_exit": 70
+  },
+  "keyboard": {
+    "dark": 60,
+    "normal": 0,
+    "bright": 0,
+    "dark_enter": 12,
+    "dark_exit": 20,
+    "bright_enter": 100,
+    "bright_exit": 70
+  },
+  "camera": {
+    "dark": 200,
+    "normal": 128,
+    "bright": 128,
+    "fps": 30
+  }
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=Авторегулировка яркости экрана и клавиатуры по датчику освещённости
+Documentation=file:/usr/share/doc/ambient-auto/README.md
+After=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/lib/ambient-auto/ambient-auto
+Restart=always
+RestartSec=3
+Nice=5
+RuntimeDirectory=ambient-auto
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
