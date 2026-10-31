@@ -2,6 +2,7 @@
   "enabled": true,
   "poll_seconds": 2.0,
   "manual_pause_minutes": 0,
+  "language": "system",
   "screen": {
     "dark": 5,
     "normal": 15,

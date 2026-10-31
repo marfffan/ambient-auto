@@ -27,6 +27,7 @@ install -d "$PKG/DEBIAN" \
 
 install -m755 "$ROOT/src/$NAME"                 "$PKG/usr/lib/$NAME/$NAME"
 install -m644 "$ROOT/src/gui.py"                "$PKG/usr/lib/$NAME/gui.py"
+install -m644 "$ROOT/src/i18n.py"               "$PKG/usr/lib/$NAME/i18n.py"
 install -m755 "$ROOT/src/$NAME-gui"             "$PKG/usr/bin/$NAME-gui"
 install -m644 "$ROOT/systemd/$NAME.service"     "$PKG/usr/lib/systemd/system/$NAME.service"
 install -m644 "$ROOT/share/config.default.json" "$PKG/usr/share/$NAME/config.default.json"
@@ -40,7 +41,7 @@ for script in postinst prerm postrm; do
 done
 
 # Проверяем синтаксис Python до упаковки.
-python3 -m py_compile "$PKG/usr/lib/$NAME/$NAME" "$PKG/usr/lib/$NAME/gui.py"
+python3 -m py_compile "$PKG/usr/lib/$NAME/$NAME" "$PKG/usr/lib/$NAME/gui.py" "$PKG/usr/lib/$NAME/i18n.py"
 find "$PKG" -name __pycache__ -type d -prune -exec rm -rf {} +
 
 INSTALLED_SIZE=$(du -sk "$PKG/usr" | cut -f1)
